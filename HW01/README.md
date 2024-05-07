@@ -12,7 +12,7 @@ The `run.sh` script is designed to streamline the startup of Jupyter and Postgre
 
 ## 2. Run Jupyter Notebook
 
-'''jupyter notebook --ip=0.0.0.0'''
+`jupyter notebook --ip=0.0.0.0`
 
 ## 3. Navigate to the Source Directory
 
