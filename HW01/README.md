@@ -8,7 +8,7 @@ This README outlines the necessary steps to set up and execute the data analysis
 
 ## 1. Running the Initialization Script
 
-The `run.sh` script is designed to streamline the startup of Jupyter and PostgreSQL containers. To execute this script:
+The `run.sh` script is designed to streamline the startup of Jupyter and PostgreSQL containers. To execute this script: `./run.sh`
 
 ## 2. Run Jupyter Notebook
 
