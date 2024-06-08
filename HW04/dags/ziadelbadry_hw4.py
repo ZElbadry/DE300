@@ -1,0 +1,344 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[ ]:
+
+
+from airflow import DAG
+from airflow.operators.python_operator import PythonOperator, BranchPythonOperator
+from airflow.providers.postgres.operators.postgres import PostgresOperator
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.utils.dates import days_ago
+import boto3
+import pandas as pd
+from io import StringIO
+import tomli
+from sqlalchemy import create_engine
+from pyspark.sql import SparkSession
+
+# Configuration parameters
+CONFIG_BUCKET = "de300-ziadelbadry"
+CONFIG_FILE = "hw4_config.toml"
+
+TABLE_NAMES = {
+    "original_data": "original_data",
+    "cleaned_data_stage1": "cleaned_data_s1",
+    "cleaned_data_stage2": "cleaned_data_s2",
+    "training_data_stage1": "training_data_s1",
+    "training_data_stage2": "training_data_s2",
+    "test_data_stage1": "test_data_s1",
+    "test_data_stage2": "test_data_s2",
+    "normalized_data_stage1": "normalized_data_s1",
+    "normalized_data_stage2": "normalized_data_s2",
+    "high_risk_features_stage1": "high_risk_features_s1",
+    "product_features_stage1": "product_features_s1",
+    "high_risk_features_stage2": "high_risk_features_s2",
+    "product_features_stage2": "product_features_s2",
+    "gender_based_statistics": "gender_stats",
+    "age_based_statistics_stage1": "age_stats_s1",
+    "age_based_statistics_stage2": "age_stats_s2",
+    "smoke_scrape_merged": "smoke_data_merged"
+}
+
+default_args = {
+    'owner': 'ziadelbadry',
+    'depends_on_past': False,
+    'start_date': days_ago(1),
+    'retries': 2,
+}
+
+# DAG definition
+dag = DAG(
+    'Ziad',
+    default_args=default_args,
+    description='Heart Disease Data Pipeline',
+    schedule_interval='@daily',
+    tags=["Heart Disease", "Data Processing", "Machine Learning"]
+)
+
+# Read config from S3
+def read_config_from_s3() -> dict:
+    s3_client = boto3.client('s3')
+    try:
+        response = s3_client.get_object(Bucket=CONFIG_BUCKET, Key=CONFIG_FILE)
+        file_content = response['Body'].read()
+        params = tomli.loads(file_content.decode('utf-8'))
+        return params
+    except Exception as e:
+        print(f"Failed to read from S3: {str(e)}")
+        return {}
+
+PARAMS = read_config_from_s3()
+
+# Database connection
+def create_db_connection():
+    conn_uri = f"{PARAMS['db']['db_alchemy_driver']}://{PARAMS['db']['username']}:{PARAMS['db']['password']}@{PARAMS['db']['host']}:{PARAMS['db']['port']}/{PARAMS['db']['db_name']}"
+    engine = create_engine(conn_uri)
+    connection = engine.connect()
+    return connection
+
+# Decorator for managing data flow between tasks
+def from_table_to_df(input_table_names: list[str], output_table_names: list[str]):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            conn = create_db_connection()
+            dfs = [pd.read_sql(f"SELECT * FROM {name}", conn) for name in input_table_names]
+            kwargs['dfs'] = dfs[0] if len(input_table_names) == 1 else dfs
+            result = func(*args, **kwargs)
+            for name in output_table_names:
+                conn.execute(f"DROP TABLE IF EXISTS {name}")
+            for pair in result['dfs']:
+                pair['df'].to_sql(pair['table_name'], conn, if_exists="replace", index=False)
+            conn.close()
+            return result
+        return wrapper
+    return decorator
+
+# Task Definitions
+
+# Initialize database schema
+initialize_schema = PostgresOperator(
+    task_id="initialize_schema",
+    postgres_conn_id=PARAMS['db']['db_connection'],
+    sql=f"""
+    DROP SCHEMA public CASCADE;
+    CREATE SCHEMA public;
+    GRANT ALL ON SCHEMA public TO {PARAMS['db']['username']};
+    GRANT ALL ON SCHEMA public TO public;
+    COMMENT ON SCHEMA public IS 'standard public schema';
+    """,
+    dag=dag
+)
+
+# Data ingestion from external source
+ingest_data = PythonOperator(
+    task_id='ingest_data',
+    python_callable=add_data_to_table_func,
+    provide_context=True,
+    dag=dag
+)
+
+# Data cleaning and preparation
+prepare_data_stage1 = PythonOperator(
+    task_id='prepare_data_s1',
+    python_callable=clean_and_impute_data_1_func,
+    provide_context=True,
+    dag=dag
+)
+
+prepare_data_stage2 = PythonOperator(
+    task_id='prepare_data_s2',
+    python_callable=clean_and_impute_data_2_func,
+    provide_context=True,
+    dag=dag
+)
+
+# Data normalization
+normalize_data_s1 = PythonOperator(
+    task_id='normalize_data_s1',
+    python_callable=normalize_data_1_func,
+    provide_context=True,
+    dag=dag
+)
+
+normalize_data_s2 = PythonOperator(
+    task_id='normalize_data_s2',
+    python_callable=normalize_data_2_func,
+    provide_context=True,
+    dag=dag
+)
+
+# Exploratory data analysis
+perform_eda_s1 = PythonOperator(
+    task_id='perform_eda_s1',
+    python_callable=eda_1_func,
+    provide_context=True,
+    dag=dag
+)
+
+perform_eda_s2 = PythonOperator(
+    task_id='perform_eda_s2',
+    python_callable=eda_2_func,
+    provide_context=True,
+    dag=dag
+)
+
+# Feature engineering
+engineer_features_high_risk_s1 = PythonOperator(
+    task_id='engineer_features_high_risk_s1',
+    python_callable=fe_high_risk_1_func,
+    provide_context=True,
+    dag=dag
+)
+
+engineer_features_product_s1 = PythonOperator(
+    task_id='engineer_features_product_s1',
+    python_callable=fe_product_1_func,
+    provide_context=True,
+    dag=dag
+)
+
+engineer_features_high_risk_s2 = PythonOperator(
+    task_id='engineer_features_high_risk_s2',
+    python_callable=fe_high_risk_2_func,
+    provide_context=True,
+    dag=dag
+)
+
+engineer_features_product_s2 = PythonOperator(
+    task_id='engineer_features_product_s2',
+    python_callable=fe_product_2_func,
+    provide_context=True,
+    dag=dag
+)
+
+# Model training
+train_logistic_regression_product_s1 = PythonOperator(
+    task_id='train_logistic_regression_product_s1',
+    python_callable=product_lr_1_func,
+    provide_context=True,
+    dag=dag
+)
+
+train_logistic_regression_high_risk_s1 = PythonOperator(
+    task_id='train_logistic_regression_high_risk_s1',
+    python_callable=high_risk_lr_1_func,
+    provide_context=True,
+    dag=dag
+)
+
+train_production_model_s1 = PythonOperator(
+    task_id='train_production_model_s1',
+    python_callable=production_lr_1_func,
+    provide_context=True,
+    dag=dag
+)
+
+train_support_vector_machine_product_s1 = PythonOperator(
+    task_id='train_support_vector_machine_product_s1',
+    python_callable=product_svm_1_func,
+    provide_context=True,
+    dag=dag
+)
+
+train_support_vector_machine_high_risk_s1 = PythonOperator(
+    task_id='train_support_vector_machine_high_risk_s1',
+    python_callable=high_risk_svm_1_func,
+    provide_context=True,
+    dag=dag
+)
+
+train_production_model_svm_s1 = PythonOperator(
+    task_id='train_production_model_svm_s1',
+    python_callable=production_svm_1_func,
+    provide_context=True,
+    dag=dag
+)
+
+train_logistic_regression_product_s2 = PythonOperator(
+    task_id='train_logistic_regression_product_s2',
+    python_callable=product_lr_2_func,
+    provide_context=True,
+    dag=dag
+)
+
+train_logistic_regression_high_risk_s2 = PythonOperator(
+    task_id='train_logistic_regression_high_risk_s2',
+    python_callable=high_risk_lr_2_func,
+    provide_context=True,
+    dag=dag
+)
+
+train_production_model_s2 = PythonOperator(
+    task_id='train_production_model_s2',
+    python_callable=production_lr_2_func,
+    provide_context=True,
+    dag=dag
+)
+
+train_support_vector_machine_product_s2 = PythonOperator(
+    task_id='train_support_vector_machine_product_s2',
+    python_callable=product_svm_2_func,
+    provide_context=True,
+    dag=dag
+)
+
+train_support_vector_machine_high_risk_s2 = PythonOperator(
+    task_id='train_support_vector_machine_high_risk_s2',
+    python_callable=high_risk_svm_2_func,
+    provide_context=True,
+    dag=dag
+)
+
+train_production_model_svm_s2 = PythonOperator(
+    task_id='train_production_model_svm_s2',
+    python_callable=production_svm_2_func,
+    provide_context=True,
+    dag=dag
+)
+
+# Model selection based on performance
+select_best_model = BranchPythonOperator(
+    task_id='select_best_model',
+    python_callable=decide_which_model,
+    provide_context=True,
+    dag=dag
+)
+
+# Placeholder for no action
+no_action = DummyOperator(
+    task_id='no_action',
+    dag=dag
+)
+
+# Data scraping for additional insights
+scrape_and_prepare_smoke_data = PythonOperator(
+    task_id='scrape_and_prepare_smoke_data',
+    python_callable=scrape_smoke_func,
+    provide_context=True,
+    dag=dag
+)
+
+# Combine scraped data with existing data
+combine_scraped_data = PythonOperator(
+    task_id='combine_scraped_data',
+    python_callable=merge_smoke_func,
+    provide_context=True,
+    dag=dag
+)
+
+# Model performance evaluation after merging new data
+evaluate_merged_logistic_regression = PythonOperator(
+    task_id='evaluate_merged_logistic_regression',
+    python_callable=merge_lr_func,
+    provide_context=True,
+    dag=dag
+)
+
+evaluate_merged_svm = PythonOperator(
+    task_id='evaluate_merged_svm',
+    python_callable=merge_svm_func,
+    provide_context=True,
+    dag=dag
+)
+
+# Define additional evaluation tasks dynamically based on feature types
+evaluation_tasks = []
+for feature_type in feature_operations:
+    task_id = f"evaluate_{feature_type}"
+    evaluation_tasks.append(PythonOperator(
+        task_id=task_id,
+        python_callable=locals()[f"{task_id}_func"],
+        provide_context=True,
+        dag=dag
+    ))
+
+# Task dependencies
+initialize_schema >> ingest_data >> [prepare_data_stage1, prepare_data_stage2]
+prepare_data_stage1 >> [normalize_data_s1, perform_eda_s1]
+prepare_data_stage2 >> [normalize_data_s2, perform_eda_s2]
+normalize_data_s1 >> [engineer_features_high_risk_s1, engineer_features_product_s1] >> [train_logistic_regression_high_risk_s1, train_logistic_regression_product_s1, train_support_vector_machine_high_risk_s1, train_support_vector_machine_product_s1] >> select_best_model
+normalize_data_s2 >> [engineer_features_high_risk_s2, engineer_features_product_s2] >> [train_logistic_regression_high_risk_s2, train_logistic_regression_product_s2, train_support_vector_machine_high_risk_s2, train_support_vector_machine_product_s2] >> select_best_model
+[engineer_features_high_risk_s1, engineer_features_product_s2, scrape_and_prepare_smoke_data] >> combine_scraped_data >> [evaluate_merged_logistic_regression, evaluate_merged_svm] >> select_best_model
+[select_best_model] >> [no_action, *evaluation_tasks]
+
